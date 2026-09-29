@@ -3549,6 +3549,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                                             "functions": spec.functions.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
                                             "events": spec.events.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
                                             "custom_types": spec.custom_types.iter().map(|t| t.name.as_str()).collect::<Vec<_>>()
+                                    });
                                 }
                                 println!("{}", serde_json::to_string(&output)?);
                             } else {
