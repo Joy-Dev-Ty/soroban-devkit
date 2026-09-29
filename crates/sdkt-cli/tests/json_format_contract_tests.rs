@@ -46,6 +46,7 @@
 use assert_cmd::Command;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use sdkt_xdr::{encode_ledger_key, LedgerKeyParams};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -55,7 +56,6 @@ use stellar_xdr::{
     Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt, Limited, Limits, ScAddress,
     ScContractInstance, ScVal, WriteXdr,
 };
-use sdkt_xdr::{encode_ledger_key, LedgerKeyParams};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -90,7 +90,8 @@ static WASM_OLD: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/us_
 static WASM_NEW: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/us_new.wasm");
 
 const RPC_CONTRACT_ID: &str = "CAE3U7JKESRWZHPEQ72DVNGOQ6WPA7HSPQZL5YV46NPCE4TMUPAGYMEC";
-const RPC_CONTRACT_ID_HEX: &str = "09ba7d2a24a36c9de487f43ab4ce87acf07cf27c32bee2bcf35e22726ca3c06c";
+const RPC_CONTRACT_ID_HEX: &str =
+    "09ba7d2a24a36c9de487f43ab4ce87acf07cf27c32bee2bcf35e22726ca3c06c";
 const RPC_WASM_HASH_HEX: &str = "60cddae67f202c19ee7b000c894fd12aa8b44de09ab652f5e188bc0c63a6cf02";
 
 fn read_rpc_request(sock: &mut TcpStream) -> String {
@@ -148,16 +149,20 @@ fn mock_contract_data_xdr() -> String {
 fn mock_storage_inspect_rpc() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let contract_data_key =
-        encode_ledger_key(&LedgerKeyParams::ContractData(RPC_CONTRACT_ID_HEX.to_string()))
-            .unwrap();
+    let contract_data_key = encode_ledger_key(&LedgerKeyParams::ContractData(
+        RPC_CONTRACT_ID_HEX.to_string(),
+    ))
+    .unwrap();
     let contract_data_xdr = mock_contract_data_xdr();
 
     thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(mut sock) = conn else { break };
             let request = read_rpc_request(&mut sock);
-            let body = request.split_once("\r\n\r\n").map(|(_, body)| body).unwrap_or("");
+            let body = request
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body)
+                .unwrap_or("");
             let request_json: Value = serde_json::from_str(body).unwrap_or_default();
             let method = request_json["method"].as_str().unwrap_or("");
             let response = match method {
@@ -205,8 +210,15 @@ fn mock_storage_inspect_rpc() -> String {
 fn run_storage_check(with_abi: bool) -> Value {
     let rpc_url = mock_storage_inspect_rpc();
     let mut cmd = sdkt();
-    cmd.args(["storage", "check", RPC_CONTRACT_ID, "--format", "json", "--rpc-url"])
-        .arg(rpc_url);
+    cmd.args([
+        "storage",
+        "check",
+        RPC_CONTRACT_ID,
+        "--format",
+        "json",
+        "--rpc-url",
+    ])
+    .arg(rpc_url);
     if with_abi {
         cmd.arg("--abi").arg(WASM_NEW);
     }
@@ -246,7 +258,10 @@ mod storage_check_json_schema {
         let existing_fields = ["contract_id", "entries"];
 
         assert_fields_unchanged(&without_abi, &with_abi, &existing_fields);
-        assert_eq!(without_abi.as_object().unwrap().len(), existing_fields.len());
+        assert_eq!(
+            without_abi.as_object().unwrap().len(),
+            existing_fields.len()
+        );
         assert_eq!(
             with_abi.as_object().unwrap().len(),
             existing_fields.len() + 1
@@ -263,7 +278,10 @@ mod storage_check_json_schema {
             "days_remaining",
             "extension_cost_stroops",
         ] {
-            assert!(entries[0].get(field).is_some(), "missing entry field `{field}`");
+            assert!(
+                entries[0].get(field).is_some(),
+                "missing entry field `{field}`"
+            );
         }
 
         assert!(with_abi["abi"]["functions"].is_array());
@@ -290,7 +308,10 @@ mod inspect_json_schema {
         ];
 
         assert_fields_unchanged(&without_abi, &with_abi, &existing_fields);
-        assert_eq!(without_abi.as_object().unwrap().len(), existing_fields.len());
+        assert_eq!(
+            without_abi.as_object().unwrap().len(),
+            existing_fields.len()
+        );
         assert_eq!(
             with_abi.as_object().unwrap().len(),
             existing_fields.len() + 1
@@ -304,7 +325,10 @@ mod inspect_json_schema {
             .as_object()
             .expect("abi_spec contains the full supplied ContractSpec");
         for field in ["env_meta", "functions", "custom_types", "events"] {
-            assert!(abi_spec.contains_key(field), "missing ABI spec field `{field}`");
+            assert!(
+                abi_spec.contains_key(field),
+                "missing ABI spec field `{field}`"
+            );
         }
     }
 }
