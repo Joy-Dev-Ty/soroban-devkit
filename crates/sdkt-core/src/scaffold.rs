@@ -117,9 +117,6 @@ impl Contract {
 rpc_url = "https://soroban-testnet.stellar.org"
 passphrase = "Test SDF Network ; September 2015"
 
-[build]
-target = "wasm32-unknown-unknown"
-
 [contracts.main]
 path = "."
 "#;
@@ -873,6 +870,7 @@ fn rule_fires_on_trigger_function() {{
         invoke_contract: 0,
         bound: Default::default(),
         usage: Default::default(),
+        division_before_multiplication: false,
     }}];
     let ctx = AuditContext {{ spec: None }};
     let mut report = AuditReport::default();
@@ -894,6 +892,7 @@ fn rule_silent_on_normal_function() {{
         invoke_contract: 0,
         bound: Default::default(),
         usage: Default::default(),
+        division_before_multiplication: false,
     }}];
     let ctx = AuditContext {{ spec: None }};
     let mut report = AuditReport::default();

@@ -63,6 +63,42 @@ fn sdkt_version_string() -> &'static str {
     }
 }
 
+#[cfg(test)]
+mod storage_label_tests {
+    use super::*;
+
+    #[test]
+    fn projects_matching_union_key_and_falls_back_for_unknown_key() {
+        let spec: sdkt_wasm::ContractSpec = serde_json::from_value(serde_json::json!({
+            "env_meta": null, "functions": [], "events": [],
+            "custom_types": [{
+                "name": "DataKey", "kind": "union", "doc": "", "type_args": [],
+                "bytes_n": null,
+                "members": [{"name": "Balance", "doc": "", "types": [{
+                    "name": "u32", "kind": "primitive", "doc": "", "members": [],
+                    "type_args": [], "bytes_n": null
+                }], "value": null}]
+            }]
+        }))
+        .unwrap();
+        let contract = "CAE3U7JKESRWZHPEQ72DVNGOQ6WPA7HSPQZL5YV46NPCE4TMUPAGYMEC";
+        let key = resolve_storage_read_key(
+            contract,
+            None,
+            Some("Balance"),
+            &["u32:7".to_string()],
+            false,
+            "persistent",
+        )
+        .unwrap();
+        assert_eq!(storage_key_label(&key, &spec), "DataKey::Balance(u32)");
+        let unknown =
+            resolve_storage_read_key(contract, None, Some("Unknown"), &[], false, "persistent")
+                .unwrap();
+        assert_eq!(storage_key_label(&unknown, &spec), unknown);
+    }
+}
+
 /// Reusable network-resolution flags shared by every command that talks to a
 /// Soroban/Stellar RPC endpoint.
 ///
@@ -1548,6 +1584,7 @@ enum StorageAction {
     },
     /// Analyze a contract's storage layout (Instance/Persistent/Temporary
     /// categorization, TTL summary, and per-entry detail).
+    #[command(alias = "snapshot")]
     Analyze {
         contract_id: String,
         /// Repeatable: extra ledger keys (base64 XDR or hex XDR) to include in
@@ -2131,8 +2168,11 @@ fn print_diff_pretty(diff: &sdkt_storage::SnapshotDiff) {
         println!("\nRemoved entries ({}):", removed.len());
         for e in &removed {
             println!(
-                "  [removed] key={} (old_ttl={})",
+                "  [removed] key={}{} (old_ttl={})",
                 e.key,
+                e.label
+                    .as_ref()
+                    .map_or(String::new(), |l| format!(" label={l}")),
                 e.old_ttl.map_or("?".to_string(), |t| t.to_string())
             );
         }
@@ -2141,14 +2181,95 @@ fn print_diff_pretty(diff: &sdkt_storage::SnapshotDiff) {
         println!("\nExpiring soon ({}):", expiring.len());
         for e in &expiring {
             println!(
-                "  [expiring] key={} (ttl={})",
+                "  [expiring] key={}{} (ttl={})",
                 e.key,
+                e.label
+                    .as_ref()
+                    .map_or(String::new(), |l| format!(" label={l}")),
+                e.new_ttl.map_or("?".to_string(), |t| t.to_string())
+            );
+        }
+    }
+    if unchanged.iter().any(|e| e.label.is_some()) {
+        println!("\nUnchanged entries ({}):", unchanged.len());
+        for e in &unchanged {
+            println!(
+                "  [unchanged] key={}{} (ttl={})",
+                e.key,
+                e.label
+                    .as_ref()
+                    .map_or(String::new(), |l| format!(" label={l}")),
                 e.new_ttl.map_or("?".to_string(), |t| t.to_string())
             );
         }
     }
     if unchanged.is_empty() && removed.is_empty() && expiring.is_empty() {
         println!("  (no entries)");
+    }
+}
+
+/// Project an ABI key name without changing the raw LedgerKey used for identity.
+fn storage_key_label(raw: &str, spec: &sdkt_wasm::ContractSpec) -> String {
+    use stellar_xdr::ScVal;
+
+    let Ok(stellar_xdr::LedgerKey::ContractData(data)) = sdkt_xdr::decode_ledger_key(raw) else {
+        return raw.to_string();
+    };
+    if matches!(data.key, ScVal::LedgerKeyContractInstance) {
+        return "instance".to_string();
+    }
+    let (name, args): (String, &[ScVal]) = match &data.key {
+        ScVal::Symbol(name) => (name.to_utf8_string_lossy(), &[]),
+        ScVal::Vec(Some(items)) => match items.first() {
+            Some(ScVal::Symbol(name)) => (name.to_utf8_string_lossy(), &items[1..]),
+            _ => return raw.to_string(),
+        },
+        _ => return raw.to_string(),
+    };
+    let name = name.as_str();
+    let mut matches =
+        spec.custom_types
+            .iter()
+            .filter(|ty| ty.kind == "union")
+            .flat_map(|ty| {
+                ty.members.iter().filter_map(move |member| {
+                    (member.name == name
+                        && member.types.len() == args.len()
+                        && member.types.iter().zip(args).all(|(ty, value)| {
+                            match ty.name.as_str() {
+                                "bool" => matches!(value, ScVal::Bool(_)),
+                                "u32" => matches!(value, ScVal::U32(_)),
+                                "i32" => matches!(value, ScVal::I32(_)),
+                                "u64" => matches!(value, ScVal::U64(_)),
+                                "i64" => matches!(value, ScVal::I64(_)),
+                                "u128" => matches!(value, ScVal::U128(_)),
+                                "i128" => matches!(value, ScVal::I128(_)),
+                                "string" => matches!(value, ScVal::String(_)),
+                                "symbol" => matches!(value, ScVal::Symbol(_)),
+                                "address" => matches!(value, ScVal::Address(_)),
+                                "bytes" => matches!(value, ScVal::Bytes(_)),
+                                _ => true,
+                            }
+                        }))
+                    .then_some((ty.name.as_str(), member))
+                })
+            });
+    let Some((type_name, member)) = matches.next() else {
+        return raw.to_string();
+    };
+    if matches.next().is_some() {
+        return raw.to_string();
+    }
+    if member.types.is_empty() {
+        format!("{type_name}::{}", member.name)
+    } else {
+        let args = member
+            .types
+            .iter()
+            .map(|ty| ty.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{type_name}::{}({args})", member.name)
     }
 }
 
@@ -3331,14 +3452,27 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                 format,
             } = &action
             {
-                if abi.is_some() || abi_contract.is_some() {
-                    eprintln!(
-                        "Error: --abi and --abi-contract options do not apply to 'storage storage-diff'"
-                    );
+                if abi.is_some() && abi_contract.is_some() {
+                    eprintln!("Error: specify only one of --abi or --abi-contract");
                     process::exit(1);
                 }
 
                 let fmt = parse_format_str(format);
+                let contract_spec = if let Some(wasm_path) = abi.as_ref() {
+                    let bytes = fs::read(wasm_path)?;
+                    Some(parse_contract_spec(&bytes)?)
+                } else if let Some(id) = abi_contract.as_ref() {
+                    let client = resolve_rpc_client(
+                        net.rpc_url.clone(),
+                        net.network_passphrase.clone(),
+                        net.network_profile.clone(),
+                    );
+                    let inspection = inspect_contract(&client, id).await?;
+                    let bytes = get_wasm_bytecode(&client, &inspection.wasm_hash).await?;
+                    Some(parse_contract_spec(&bytes)?)
+                } else {
+                    None
+                };
 
                 // Load old snapshot JSON (output of `sdkt storage analyze --format json`).
                 let old_bytes = match fs::read(old) {
@@ -3374,20 +3508,29 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
 
-                let old_snap = match sdkt_storage::StorageSnapshot::from_report(&old_report) {
+                let mut old_snap = match sdkt_storage::StorageSnapshot::from_report(&old_report) {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("Failed to load --old snapshot '{old}': {e}");
                         process::exit(1);
                     }
                 };
-                let new_snap = match sdkt_storage::StorageSnapshot::from_report(&new_report) {
+                let mut new_snap = match sdkt_storage::StorageSnapshot::from_report(&new_report) {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("Failed to load --new snapshot '{new}': {e}");
                         process::exit(1);
                     }
                 };
+                if let Some(spec) = contract_spec.as_ref() {
+                    for entry in old_snap
+                        .entries
+                        .iter_mut()
+                        .chain(new_snap.entries.iter_mut())
+                    {
+                        entry.label = Some(storage_key_label(&entry.key, spec));
+                    }
+                }
                 let diff = match sdkt_storage::diff_snapshots(&old_snap, &new_snap) {
                     Ok(d) => d,
                     Err(e) => {
@@ -3612,7 +3755,12 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                         .inspect_contract_storage_keys(&contract_id, &extra_keys)
                         .await
                     {
-                        Ok(report) => {
+                        Ok(mut report) => {
+                            if let Some(spec) = contract_spec.as_ref() {
+                                for entry in &mut report.entries {
+                                    entry.label = Some(storage_key_label(&entry.key, spec));
+                                }
+                            }
                             if fmt == OutputFormat::Json {
                                 println!("{}", serde_json::to_string(&report)?);
                             } else {
@@ -3648,6 +3796,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                                             entry.days_remaining,
                                             entry.extension_cost_stroops
                                         );
+                                        if let Some(label) = &entry.label {
+                                            println!("        key={} label={}", entry.key, label);
+                                        }
                                     }
                                 }
                             }
@@ -3707,12 +3858,19 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let identity_store = sdkt_storage::IdentityStore::new()
                         .map_err(|e| format!("Failed to access identity store: {}", e))?;
+                    // `--identity` defaults to the reserved "default" sentinel;
+                    // resolve it to the configured default identity, if any.
                     let identity_obj = identity_store
-                        .get(&identity)
-                        .map_err(|e| format!("Identity '{}' not found: {}", identity, e))?;
-                    let signing_key = identity_store.load_signing_key(&identity).map_err(|e| {
-                        format!("Failed to load signing key for '{}': {}", identity, e)
-                    })?;
+                        .resolve_signing_identity(&identity)
+                        .map_err(|e| format!("Failed to resolve signing identity: {}", e))?;
+                    let signing_key = identity_store
+                        .load_signing_key(&identity_obj.name)
+                        .map_err(|e| {
+                            format!(
+                                "Failed to load signing key for '{}': {}",
+                                identity_obj.name, e
+                            )
+                        })?;
                     let signer = sdkt_xdr::sign::Ed25519Signer::from_seed(&signing_key.to_bytes());
                     let source_account = identity_obj.public_key.clone();
                     let client = SorobanRpcClient::from_config(&network_config);
@@ -3808,12 +3966,19 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let identity_store = sdkt_storage::IdentityStore::new()
                         .map_err(|e| format!("Failed to access identity store: {}", e))?;
+                    // `--identity` defaults to the reserved "default" sentinel;
+                    // resolve it to the configured default identity, if any.
                     let identity_obj = identity_store
-                        .get(&identity)
-                        .map_err(|e| format!("Identity '{}' not found: {}", identity, e))?;
-                    let signing_key = identity_store.load_signing_key(&identity).map_err(|e| {
-                        format!("Failed to load signing key for '{}': {}", identity, e)
-                    })?;
+                        .resolve_signing_identity(&identity)
+                        .map_err(|e| format!("Failed to resolve signing identity: {}", e))?;
+                    let signing_key = identity_store
+                        .load_signing_key(&identity_obj.name)
+                        .map_err(|e| {
+                            format!(
+                                "Failed to load signing key for '{}': {}",
+                                identity_obj.name, e
+                            )
+                        })?;
                     let signer = sdkt_xdr::sign::Ed25519Signer::from_seed(&signing_key.to_bytes());
                     let source_account = identity_obj.public_key.clone();
                     let client = SorobanRpcClient::from_config(&network_config);
@@ -4868,10 +5033,24 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                         process::exit(1);
                     }
                 };
-                let signing_key = match store.load_signing_key(&identity) {
+                // The flag defaults to the reserved "default" sentinel, which
+                // resolves to the configured default identity; an explicit name
+                // is looked up verbatim.
+                let identity_obj = match store.resolve_signing_identity(&identity) {
+                    Ok(obj) => obj,
+                    Err(e) => {
+                        if identity == sdkt_storage::DEFAULT_IDENTITY_NAME {
+                            eprintln!("Error: {}", e);
+                        } else {
+                            eprintln!("Error: unknown identity '{}'", identity);
+                        }
+                        process::exit(1);
+                    }
+                };
+                let signing_key = match store.load_signing_key(&identity_obj.name) {
                     Ok(k) => k,
-                    Err(_) => {
-                        eprintln!("Error: unknown identity '{}'", identity);
+                    Err(e) => {
+                        eprintln!("Error: cannot load identity '{}': {}", identity_obj.name, e);
                         process::exit(1);
                     }
                 };
@@ -6639,15 +6818,22 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Load identity for signing (shared by both code sources).
+            // Load identity for signing (shared by both code sources). The
+            // `--identity` flag defaults to the reserved "default" sentinel, so
+            // resolve it to the configured default identity.
             let identity_store = sdkt_storage::IdentityStore::new()
                 .map_err(|e| format!("Failed to access identity store: {}", e))?;
             let identity_obj = identity_store
-                .get(&identity)
-                .map_err(|e| format!("Identity '{}' not found: {}", identity, e))?;
+                .resolve_signing_identity(&identity)
+                .map_err(|e| format!("Failed to resolve signing identity: {}", e))?;
             let signing_key = identity_store
-                .load_signing_key(&identity)
-                .map_err(|e| format!("Failed to load signing key for '{}': {}", identity, e))?;
+                .load_signing_key(&identity_obj.name)
+                .map_err(|e| {
+                    format!(
+                        "Failed to load signing key for '{}': {}",
+                        identity_obj.name, e
+                    )
+                })?;
             let signer = sdkt_xdr::sign::Ed25519Signer::from_seed(&signing_key.to_bytes());
 
             let client = SorobanRpcClient::from_config(&network_config);
@@ -6977,15 +7163,22 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                 other => Network::Custom(other.to_string()),
             };
 
-            // 2. Load the signing identity (keystore; no secret on argv).
+            // 2. Load the signing identity (keystore; no secret on argv). The
+            //    `--identity` flag defaults to the reserved "default" sentinel,
+            //    which resolves to the configured default identity.
             let identity_store = sdkt_storage::IdentityStore::new()
                 .map_err(|e| format!("Failed to access identity store: {e}"))?;
             let identity_obj = identity_store
-                .get(&identity)
-                .map_err(|e| format!("Identity '{}' not found: {e}", identity))?;
+                .resolve_signing_identity(&identity)
+                .map_err(|e| format!("Failed to resolve signing identity: {e}"))?;
             let signing_key = identity_store
-                .load_signing_key(&identity)
-                .map_err(|e| format!("Failed to load signing key for '{}': {e}", identity))?;
+                .load_signing_key(&identity_obj.name)
+                .map_err(|e| {
+                    format!(
+                        "Failed to load signing key for '{}': {e}",
+                        identity_obj.name
+                    )
+                })?;
             let signer = Ed25519Signer::from_seed(&signing_key.to_bytes());
 
             // 3. Parse typed args (shared parser; strict — typos must not be
@@ -7656,15 +7849,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                 // contract — and avoids a redundant store lookup per iteration.
                 let identity_store = sdkt_storage::IdentityStore::new()
                     .map_err(|e| format!("Failed to access identity store: {}", e))?;
-                let identity_obj = if identity == "default" {
-                    identity_store
-                        .get_default()
-                        .map_err(|e| format!("Default identity not found: {}", e))?
-                } else {
-                    identity_store
-                        .get(&identity)
-                        .map_err(|e| format!("Identity '{}' not found: {}", identity, e))?
-                };
+                let identity_obj = identity_store
+                    .resolve_signing_identity(&identity)
+                    .map_err(|e| format!("Failed to resolve signing identity: {}", e))?;
                 let signing_key = identity_store
                     .load_signing_key(&identity_obj.name)
                     .map_err(|e| format!("Failed to load signing key: {}", e))?;
