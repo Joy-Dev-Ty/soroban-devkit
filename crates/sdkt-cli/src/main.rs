@@ -14,7 +14,9 @@ use sdkt_rpc::{
     SorobanRpcClient, StorageKeyInfo, TtlInfoSummary,
 };
 use sdkt_storage::WasmCache;
-use sdkt_storage::{NetworkProfile, NetworkStore, StorageAnalyzer};
+use sdkt_storage::{
+    NetworkProfile, NetworkStore, StorageAnalyzer, DEFAULT_SUGGESTED_LEDGERS, EXPIRING_SOON_LEDGERS,
+};
 use sdkt_wasm::spec::parse_contract_spec;
 use sdkt_xdr::abi_decode::decode_event_topics;
 use sdkt_xdr::decode;
@@ -3693,21 +3695,15 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                     match get_ttl_info(&client, &contract_id).await {
                         Ok(ttl_info) => {
                             if fmt == OutputFormat::Json {
-                                if let Some(spec) = contract_spec {
-                                    let json_str = serde_json::to_string(&serde_json::json!({
-                                        "contract_id": contract_id,
-                                        "entries": ttl_info.entries.len(),
-                                        "abi": serde_json::json!({
+                                let mut output = serde_json::to_value(&ttl_info)?;
+                                if let Some(spec) = contract_spec.as_ref() {
+                                    output["abi"] = serde_json::json!({
                                             "functions": spec.functions.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
                                             "events": spec.events.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
                                             "custom_types": spec.custom_types.iter().map(|t| t.name.as_str()).collect::<Vec<_>>()
-                                        })
-                                    }))?;
-                                    println!("{}", json_str);
-                                } else {
-                                    let json_str = serde_json::to_string(&ttl_info)?;
-                                    println!("{}", json_str);
+                                    });
                                 }
+                                println!("{}", serde_json::to_string(&output)?);
                             } else {
                                 println!("Storage Check for Contract ID: {}", contract_id);
                                 println!("Total Entries: {}", ttl_info.entries.len());
@@ -4109,8 +4105,25 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                         .await
                     {
                         Ok(res) => {
+                            // TTL context is optional enrichment. If fetching
+                            // the current ledger fails, keep the absolute TTL
+                            // display and existing JSON shape.
+                            let ttl_context = if let Some(live_until) = res.live_until_ledger {
+                                client.get_ledger().await.ok().map(|ledger| {
+                                    let remaining = live_until.saturating_sub(ledger.sequence);
+                                    (remaining, remaining <= EXPIRING_SOON_LEDGERS)
+                                })
+                            } else {
+                                None
+                            };
+
                             if fmt == OutputFormat::Json {
-                                println!("{}", serde_json::to_string(&res)?);
+                                let mut output = serde_json::to_value(&res)?;
+                                if let Some((remaining, expiring_soon)) = ttl_context {
+                                    output["ledgers_remaining"] = serde_json::json!(remaining);
+                                    output["expiring_soon"] = serde_json::json!(expiring_soon);
+                                }
+                                println!("{}", serde_json::to_string(&output)?);
                             } else {
                                 println!("Contract State Read");
                                 println!("  Contract:       {}", res.contract_id);
@@ -4120,7 +4133,22 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                                     println!("  Durability:     {dur}");
                                 }
                                 if let Some(ttl) = res.live_until_ledger {
-                                    println!("  Live Until:     {ttl} (ledger)");
+                                    if let Some((remaining, expiring_soon)) = ttl_context {
+                                        let approx_days = remaining as f64 * 5.0 / 86_400.0;
+                                        println!(
+                                            "  Live Until:     {ttl} (ledger; {remaining} ledgers remaining, ~{approx_days:.2} days at 5s/ledger)"
+                                        );
+                                        if expiring_soon {
+                                            println!(
+                                                "  Caution:        Entry is expiring soon. Extend it with: sdkt storage extend --contract {} --key {} --ledgers {}",
+                                                res.contract_id,
+                                                res.key,
+                                                DEFAULT_SUGGESTED_LEDGERS
+                                            );
+                                        }
+                                    } else {
+                                        println!("  Live Until:     {ttl} (ledger)");
+                                    }
                                 }
                                 println!(
                                     "  Value:          {}",
@@ -4186,18 +4214,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             match inspect_contract(&client, &contract_id).await {
                 Ok(inspection) => {
                     if fmt == OutputFormat::Json {
-                        if let Some(spec) = contract_spec {
-                            let json_str = serde_json::to_string(&serde_json::json!({
-                                "contract_id": inspection.contract_id,
-                                "wasm_hash": inspection.wasm_hash,
-                                "storage_keys": inspection.storage_keys.len(),
-                                "abi": spec
-                            }))?;
-                            println!("{}", json_str);
-                        } else {
-                            let json_str = serde_json::to_string(&inspection)?;
-                            println!("{}", json_str);
+                        let mut output = serde_json::to_value(&inspection)?;
+                        if let Some(spec) = contract_spec.as_ref() {
+                            output["abi_spec"] = serde_json::to_value(spec)?;
                         }
+                        println!("{}", serde_json::to_string(&output)?);
                     } else {
                         if interface {
                             if let Some(spec) = contract_spec.as_ref() {
@@ -4783,7 +4804,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                     net.network_profile.clone(),
                 );
 
-                use sdkt_rpc::{submit_and_wait, PollConfig};
+                use sdkt_rpc::{submit_and_wait, PollConfig, TransactionStatus};
                 use std::time::Duration;
 
                 let poll_cfg = PollConfig {
@@ -4811,6 +4832,25 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                                     println!("    {}", event);
                                 }
                             }
+                            if let Some(code) = &res.error_code {
+                                println!("  Error:    {}", code);
+                            }
+                            if let Some(xdr) = &res.error_result_xdr {
+                                println!("  Error Result XDR: {}", xdr);
+                            }
+                            if !res.diagnostic_events.is_empty() {
+                                println!("  Diagnostics:");
+                                for event in &res.diagnostic_events {
+                                    println!("    {}", event);
+                                }
+                            }
+                        }
+                        // A settled on-chain failure must not look like a
+                        // success to scripts: match `invoke`, which already
+                        // exits 1 unless the status is SUCCESS (a no-wait
+                        // PENDING submission still exits 0).
+                        if res.status == TransactionStatus::Failed {
+                            process::exit(1);
                         }
                     }
                     Err(e) => {
